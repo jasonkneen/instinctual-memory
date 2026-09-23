@@ -1,0 +1,5 @@
+/mem/.models
+/target
+*.jsonl
+/mem
+.env
