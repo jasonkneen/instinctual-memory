@@ -145,7 +145,8 @@ Keys and settings come from the environment, else the nearest `.env` that define
 | `MEM_LLM_MODEL` | Consolidation model | `anthropic/claude-haiku-4.5` |
 | `MEM_LLM_BASE_URL` | OpenAI-compatible endpoint for consolidation | `https://openrouter.ai/api/v1` |
 | `MEM_JEV_MODEL` / `JEV_MODEL` | JEV model | `~typesafe/jev-latest` |
-| `OPENROUTER_DECISIONS_BASE_URL` | Decisions API endpoint | `https://openrouter.ai/api/alpha/decisions` |
+| `MEM_JEV_BASE_URL` | Exact JEV endpoint, used verbatim (self-hosted or proxied JEV) | — |
+| `OPENROUTER_DECISIONS_BASE_URL` | OpenRouter API root; `/alpha/decisions` is appended | `https://openrouter.ai/api/alpha/decisions` |
 | `MEM_JEV_DOTENV_PATH` | Read keys from this file instead of searching | — |
 | `MEM_RERANK=off` | Never rerank (no network calls from search) | on |
 | `MEM_LAYA_MODEL` | Local reranker: `bge-reranker-base`, `jina`, `bge-v2-m3` | what `models pull` chose |
