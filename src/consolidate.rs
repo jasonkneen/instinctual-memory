@@ -573,6 +573,65 @@ const NOTE_EVENT_CHARS: usize = 8_000;
 /// Characters of event text per request.
 const BATCH_CHARS: usize = 16_000;
 
+/// In-flight extraction requests when `MEM_LLM_CONCURRENCY` is unset. Firing
+/// every batch at once overwhelms a single model server: the tail requests
+/// queue behind the rest and time out. Small local servers serialize anyway,
+/// so a bound costs little and keeps the queue short.
+const DEFAULT_LLM_CONCURRENCY: usize = 8;
+/// Ceiling for `MEM_LLM_CONCURRENCY`, so a typo cannot spawn hundreds of calls.
+const MAX_LLM_CONCURRENCY: usize = 64;
+/// Seconds one extraction request may take when `MEM_LLM_TIMEOUT` is unset.
+/// This includes waiting behind other in-flight requests, so it is generous.
+const DEFAULT_LLM_TIMEOUT_SECS: u64 = 600;
+
+/// Max in-flight extraction requests (`MEM_LLM_CONCURRENCY`, default 8,
+/// clamped to 1..=64; an unset or invalid value uses the default).
+pub(crate) fn llm_concurrency() -> usize {
+    match std::env::var("MEM_LLM_CONCURRENCY") {
+        Ok(v) => parse_concurrency(&v),
+        Err(_) => DEFAULT_LLM_CONCURRENCY,
+    }
+}
+
+fn parse_concurrency(value: &str) -> usize {
+    value
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|n| *n >= 1)
+        .map(|n| n.min(MAX_LLM_CONCURRENCY))
+        .unwrap_or(DEFAULT_LLM_CONCURRENCY)
+}
+
+/// How long one extraction request may take (`MEM_LLM_TIMEOUT` seconds,
+/// default 600).
+fn llm_timeout() -> std::time::Duration {
+    let secs = std::env::var("MEM_LLM_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s >= 1)
+        .unwrap_or(DEFAULT_LLM_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// The bounded pool the extraction batches run in. One pool per process,
+/// sized once from the environment.
+fn llm_pool() -> &'static rayon::ThreadPool {
+    static POOL: once_cell::sync::Lazy<rayon::ThreadPool> = once_cell::sync::Lazy::new(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(llm_concurrency())
+            .thread_name(|i| format!("mem-llm-{i}"))
+            .build()
+            .unwrap_or_else(|_| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .expect("single-thread llm pool")
+            })
+    });
+    &POOL
+}
+
 const EXTRACTOR_SYSTEM_PROMPT: &str = r#"You extract durable memory for a coding agent from a user's own messages and project memory files.
 
 A fact is worth keeping only if it will still be true and useful in a session weeks from now, in a different task: the user's identity and role, standing preferences and working rules, project facts (what it is, stack, architecture, conventions, commands, decisions and why), and named people or organisations with a stated relationship.
@@ -668,10 +727,14 @@ fn llm_extract(
     }
 
     let known = known_entities(&ex.entities);
-    let replies: Vec<Result<LlmOutput>> = batches
-        .par_iter()
-        .map(|batch| call_llm(&cfg, &known, batch))
-        .collect();
+    // Run the batches in a small bounded pool: a single model server cannot
+    // absorb one request per batch, and the tail would otherwise time out.
+    let replies: Vec<Result<LlmOutput>> = llm_pool().install(|| {
+        batches
+            .par_iter()
+            .map(|batch| call_llm(&cfg, &known, batch))
+            .collect()
+    });
 
     let by_seq: BTreeMap<u64, &JournalEvent> = events.iter().map(|e| (e.seq, e)).collect();
     let verbose = std::env::var("MEM_CONSOLIDATE_VERBOSE").is_ok_and(|v| v == "1");
@@ -848,7 +911,7 @@ pub(crate) fn chat_json<T: serde::de::DeserializeOwned>(cfg: &LlmConfig, system:
         let sent = ureq::post(&cfg.url)
             .set("Authorization", &format!("Bearer {}", cfg.key))
             .set("Content-Type", "application/json")
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(llm_timeout())
             .send_json(body.clone());
         let payload: serde_json::Value = match sent.map(|r| r.into_json()) {
             Ok(Ok(v)) => v,
@@ -1057,6 +1120,19 @@ mod tests {
             high_water: 100,
             scope_id: Some("personal".into()),
         }
+    }
+
+    #[test]
+    fn llm_concurrency_is_bounded_and_defaults() {
+        assert_eq!(parse_concurrency("1"), 1);
+        assert_eq!(parse_concurrency("8"), 8);
+        assert_eq!(parse_concurrency(" 12 "), 12);
+        // Unset, zero, negative, and garbage all use the default.
+        assert_eq!(parse_concurrency("0"), DEFAULT_LLM_CONCURRENCY);
+        assert_eq!(parse_concurrency("-3"), DEFAULT_LLM_CONCURRENCY);
+        assert_eq!(parse_concurrency("nope"), DEFAULT_LLM_CONCURRENCY);
+        // A typo cannot spawn unbounded calls.
+        assert_eq!(parse_concurrency("999"), MAX_LLM_CONCURRENCY);
     }
 
     #[test]

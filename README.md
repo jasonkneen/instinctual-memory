@@ -140,6 +140,8 @@ Keys and settings come from the environment, else the nearest `.env` that define
 | `OPENROUTER_API_KEY` (or `MEM_JEV_API_KEY`, `MEM_LLM_API_KEY`) | JEV reranking and the LLM extractor | — |
 | `MEM_LLM_MODEL` | Consolidation model | `anthropic/claude-haiku-4.5` |
 | `MEM_LLM_BASE_URL` | OpenAI-compatible endpoint for consolidation | `https://openrouter.ai/api/v1` |
+| `MEM_LLM_CONCURRENCY` | In-flight extraction requests (1–64); bounds load on a single model server | `8` |
+| `MEM_LLM_TIMEOUT` | Seconds one extraction request may take, including queue wait | `600` |
 | `MEM_JEV_MODEL` / `JEV_MODEL` | JEV model | `~typesafe/jev-latest` |
 | `OPENROUTER_DECISIONS_BASE_URL` | Decisions API endpoint | `https://openrouter.ai/api/alpha/decisions` |
 | `MEM_JEV_DOTENV_PATH` | Read keys from this file instead of searching | — |
