@@ -2,7 +2,7 @@
 
 Git-first durable memory for AI agents.
 
-`mem` reads the conversations you have already had with Claude Code, Codex, and OpenCode, plus your `AGENTS.md`/`CLAUDE.md`/`README.md` files, and turns them into a small set of curated, sourced facts stored in a plain Git repository. Agents search that memory (facts and raw sessions together), read it over MCP, change it through a validated path, and get it written back into each project's `AGENTS.md`.
+`mem` reads the conversations you have already had with Claude Code, Codex, OpenCode, pi, and omp, plus your `AGENTS.md`/`CLAUDE.md`/`README.md` files, and turns them into a small set of curated, sourced facts stored in a plain Git repository. Agents search that memory (facts and raw sessions together), read it over MCP, change it through a validated path, and get it written back into each project's `AGENTS.md`.
 
 No database, no vector store, no server to run: one bare Git repository and a journal directory.
 
@@ -63,8 +63,8 @@ sessions, AGENTS.md ──ingest/backfill──▶ journal/ (append-only, one ev
 | Command | What it does |
 |---|---|
 | `mem init [--global]` | Create a local store at the project root, or the global store. Never touches an existing one. |
-| `mem backfill-local [--project DIR]` | One project's Claude Code, Codex, and OpenCode sessions (working directory inside the project), transcripts inside it, and its memory files. |
-| `mem backfill-all [--source claude,codex,opencode]` | Every local session from every project. |
+| `mem backfill-local [--project DIR]` | One project's Claude Code, Codex, OpenCode, pi, and omp sessions (working directory inside the project), transcripts inside it, and its memory files. |
+| `mem backfill-all [--source claude,codex,opencode,pi,omp]` | Every local session from every project. |
 | `mem backfill PATHS... [--project DIR]` | Files and directories, each routed to its format (`mem formats`). |
 | `mem ingest FILES... [--format F] [--project DIR]` | Specific files. |
 | `mem consolidate [--extractor auto\|llm\|rules] [--high-water N]` | Journal → facts, batch by batch until caught up. `auto` uses the LLM when a key is set. |
@@ -81,7 +81,7 @@ sessions, AGENTS.md ──ingest/backfill──▶ journal/ (append-only, one ev
 | `mem models pull [--model M]` / `mem models status` | Download the local reranker used when no JEV key is set. |
 | `mem serve --stdio` / `mem serve --http --listen 127.0.0.1:8765` | MCP over stdio, or loopback HTTP with server-sent events. |
 | `mem shell` | Line-oriented memory shell (`help` lists its commands). |
-| `mem setup [claude\|codex] [--remove]` | Install hooks, MCP, and the `/mem` skill so agents use memory automatically. |
+| `mem setup [claude\|codex\|pi\|omp] [--remove] [--no-mcp]` | Install hooks, MCP, the pi/omp extension, and the `/mem` skill so agents use memory automatically. |
 | `mem hook start\|prompt\|end\|sync` | Hook entry points (reads the hook JSON on stdin); `sync` backfills and consolidates by hand. |
 
 `--output-format json|text|stream-json` controls `search`, `status`, and `evaluate`.
@@ -104,7 +104,10 @@ sessions, AGENTS.md ──ingest/backfill──▶ journal/ (append-only, one ev
 ## Make agents use it: `mem setup`
 
 ```bash
-mem setup            # Claude Code + Codex; `mem setup claude` or `mem setup codex` for one; `--remove` undoes it
+mem setup            # Claude Code + Codex + pi + omp
+mem setup pi         # just the pi extension + /mem skill
+mem setup omp        # omp extension + MCP server + /mem skill
+mem setup --remove   # undo everything setup installed
 ```
 
 Every file it edits is backed up first (`*.mem-backup-<time>`), and running it again changes nothing. It installs:
@@ -114,12 +117,13 @@ Every file it edits is backed up first (`*.mem-backup-<time>`), and running it a
   - `UserPromptSubmit` → `mem hook prompt`: the curated facts that match the message (a fact must share at least two meaningful words with it; short prompts and slash commands are skipped). Lexical only, about half a second, no network.
   - `SessionEnd` → `mem hook end`: in the background, backfill the finished session into the journal, and consolidate once 200+ new events have built up and an LLM key is set (`MEM_AUTO_CONSOLIDATE=<n>`, or `0` to turn that off).
   - Hooks use the store for the session's folder (local, else global with `--project` filtering), stay silent when there is none, and never fail a session (`MEM_HOOK_DEBUG=1` shows why they did nothing).
-- **The `mem` MCP server** for Claude Code (user scope) and Codex (`~/.codex/config.toml`): `memory_search`, `memory_read`, `memory_history`, `memory_status`, `memory_request_change`, `tasks_read`, `tasks_update`.
-- **The `/mem` skill** (`~/.claude/skills/mem`): `/mem <question>`, `/mem sync`, `/mem remember …`, `/mem writeback`. It finds or creates the store, syncs it, then answers or changes memory.
+- **The `mem` MCP server** for Claude Code (user scope), Codex (`~/.codex/config.toml`), and omp (`~/.omp/agent/mcp.json`): `memory_search`, `memory_read`, `memory_history`, `memory_status`, `memory_request_change`, `tasks_read`, `tasks_update`.
+- **The pi/omp extension** (`~/.pi/agent/extensions/mem.ts`, `~/.omp/agent/extensions/mem.ts`): appends the user's preferences and the facts that match each prompt to the system prompt, exposes `memory_search` / `memory_read` / `memory_history` / `memory_status` / `memory_request_change` as native tools (omp gets them from MCP instead, so the model never sees two sets), and backfills the finished session in the background on exit. Set `MEM_BIN` to point at a `mem` that is not on PATH, or `MEM_EXTENSION_TOOLS=1|0` to force the tools on or off.
+- **The `/mem` skill** (`~/.claude/skills/mem` and the shared `~/.agents/skills/mem`, read by pi and omp): `/mem <question>`, `/mem sync`, `/mem remember …`, `/mem writeback`. It finds or creates the store, syncs it, then answers or changes memory.
 
-Codex and OpenCode also read `AGENTS.md`; keep it current with `mem writeback --to AGENTS.md`.
+Codex, OpenCode, pi, and omp also read `AGENTS.md`; keep it current with `mem writeback --to AGENTS.md`.
 
-Manual MCP registration, if you prefer: `claude mcp add mem -- mem serve --stdio` (local store of the session's project) or `… mem --global serve --stdio`; any MCP client can run `mem --root /abs/path serve --stdio` for a fixed store. Tools: `memory_search`, `memory_read`, `memory_history`, `memory_status`, `memory_request_change` (remember/correct/forget), `tasks_read`, `tasks_update`.
+Manual MCP registration, if you prefer: `claude mcp add mem -- mem serve --stdio` (local store of the session's project) or `… mem --global serve --stdio`; any MCP client can run `mem --root /abs/path serve --stdio` for a fixed store. `mem op <operation> --args '<json>'` runs any MCP operation from the shell. Tools: `memory_search`, `memory_read`, `memory_history`, `memory_status`, `memory_request_change` (remember/correct/forget), `tasks_read`, `tasks_update`.
 
 ## HTTP
 
@@ -146,6 +150,10 @@ Keys and settings come from the environment, else the nearest `.env` that define
 | `MEM_RERANK=off` | Never rerank (no network calls from search) | on |
 | `MEM_LAYA_MODEL` | Local reranker: `bge-reranker-base`, `jina`, `bge-v2-m3` | what `models pull` chose |
 | `MEM_AUTO_CONSOLIDATE` | New events that make the session-end hook consolidate (`0` = never) | `200` |
+| `MEM_PI_AGENT_DIR` / `PI_CODING_AGENT_DIR` | Where pi stores its sessions (`sessions/` inside it) | `~/.pi/agent` |
+| `MEM_OMP_AGENT_DIR` | Where omp stores its sessions (`sessions/` inside it) | `~/.omp/agent` |
+| `MEM_BIN` | `mem` binary the pi/omp extension runs | `mem` on PATH |
+| `MEM_EXTENSION_TOOLS` | pi/omp extension: `1` force native tools, `0` skip them (MCP) | auto |
 | `MEM_HOOK_DEBUG=1` | Print why a hook did nothing | off |
 | `MEM_CONSOLIDATE_VERBOSE=1` | Log each proposed fact that consolidation rejected or dropped, with the reason | off |
 | `MEM_JOURNAL_FSYNC=0` | Skip fsync during bulk backfill (the journal can be rebuilt from its sources) | fsync on |

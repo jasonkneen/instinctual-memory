@@ -1,6 +1,6 @@
 ---
 name: mem
-description: Durable project memory with the `mem` CLI. Use when the user types /mem, asks what is remembered or known about a project ("what do we know about deploys", "check memory", "have we decided X before"), asks to remember, correct, or forget something, or asks to sync memory or update AGENTS.md from memory. Finds or creates the project's memory store, brings it up to date from past Claude Code / Codex / OpenCode sessions and AGENTS.md, then answers or changes memory.
+description: Durable project memory with the `mem` CLI. Use when the user types /mem, asks what is remembered or known about a project ("what do we know about deploys", "check memory", "have we decided X before"), asks to remember, correct, or forget something, or asks to sync memory or update AGENTS.md from memory. Finds or creates the project's memory store, brings it up to date from past Claude Code / Codex / OpenCode / pi / omp sessions and AGENTS.md, then answers or changes memory.
 argument-hint: "[question | sync | remember <fact> | forget <what> | writeback | tidy | status]"
 allowed-tools:
   - Bash
@@ -11,6 +11,8 @@ allowed-tools:
 
 `mem` keeps a project's durable memory: curated facts (with sources) in a Git store, plus the raw journal of past agent sessions. Run every command from the project root unless told otherwise.
 
+In pi and omp, `mem setup` also installs an extension that injects memory automatically: the user's preferences and matching facts are appended to the system prompt, `memory_search` / `memory_read` / `memory_history` / `memory_status` / `memory_request_change` are available as native tools (omp uses the `mem` MCP server instead), and the session is backfilled in the background on exit. This skill is the fallback and the `/mem` entry point for every harness.
+
 ## 1. Make sure memory is ready (every time)
 
 ```bash
@@ -18,8 +20,7 @@ command -v mem || echo "mem not installed"
 mem status
 ```
 
-- `mem` missing: tell the user `mem` is not on PATH (install: `cargo install --path <mem repo>`, or link its `target/release/mem` into `~/.local/bin`). Stop.
-- `fatal: not a mem store`: no local store here or above, and no global one. Create a local store at the project root with `mem init`, then continue with step 2. (If the user wants one memory for every project instead, `mem init --global` and add `--global` to every command below.)
+- `mem` missing: tell the user `mem` is not on PATH (install: `cargo install --path <mem repo>`, or link its `target/release/mem` into `~/.local/bin`). Stop.- `fatal: not a mem store`: no local store here or above, and no global one. Create a local store at the project root with `mem init`, then continue with step 2. (If the user wants one memory for every project instead, `mem init --global` and add `--global` to every command below.)
 - Otherwise `mem status` prints JSON. Read `store`, `journal.events`, `unconsolidated_events`, `active_facts`, `extractor`, `reranker`.
 
 ## 2. Bring it up to date (when the user asks to sync, when the journal is empty, or before answering if the last sync looks stale)

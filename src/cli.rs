@@ -24,7 +24,7 @@ use crate::consolidate::{ConsolidateOptions, Consolidator, ExtractorKind};
 use crate::entity::EntityFile;
 use crate::error::{Error, Result};
 use crate::fact::{Fact, FactKind, FactStatus, Role as FactRole, SourceRef, Visibility};
-use crate::ingest::{adapter_for, ChatExportAdapter, ClaudeAdapter, CodexAdapter};
+use crate::ingest::{adapter_for, ChatExportAdapter, ClaudeAdapter, CodexAdapter, PiAdapter};
 use crate::ingest::Adapter as IngestAdapter;
 use crate::journal::{Journal, JournalEvent, Role, Source};
 use crate::paths::request_id as validate_request_id;
@@ -35,7 +35,7 @@ use crate::repo::GitRepo;
     name = "mem",
     version,
     about = "Git-first durable memory for AI agents",
-    long_about = "Git-first durable memory for AI agents.\n\nBackfill Claude Code, Codex, and OpenCode sessions and AGENTS.md-style files into a journal, consolidate them into curated facts in a bare Git repository, search facts and sessions together, and write a project's memory back into its AGENTS.md. Serve the same memory to agents over MCP (`mem serve --stdio`)."
+    long_about = "Git-first durable memory for AI agents.\n\nBackfill Claude Code, Codex, OpenCode, pi, and omp sessions and AGENTS.md-style files into a journal, consolidate them into curated facts in a bare Git repository, search facts and sessions together, and write a project's memory back into its AGENTS.md. Serve the same memory to agents over MCP (`mem serve --stdio`)."
 )]
 pub struct Cli {
     /// Store directory to use (holds memory.git, journal/, intents/,
@@ -219,10 +219,10 @@ pub enum Command {
         #[arg(long)]
         project: Option<PathBuf>,
     },
-    /// Ingest one project's history: Claude Code, Codex, and OpenCode
-    /// sessions whose working directory is inside the project, transcripts
-    /// inside it, and its AGENTS.md / CLAUDE.md / README.md. Re-running adds
-    /// only new events.
+    /// Ingest one project's history: Claude Code, Codex, OpenCode, pi, and
+    /// omp sessions whose working directory is inside the project,
+    /// transcripts inside it, and its AGENTS.md / CLAUDE.md / README.md.
+    /// Re-running adds only new events.
     BackfillLocal {
         /// Override the project root (defaults to the current working dir).
         #[arg(long)]
@@ -231,12 +231,13 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Ingest every local Claude Code, Codex, and OpenCode session from every
-    /// project. Each event records its project, so `search --project` and
-    /// `writeback` still pull out one project's memory.
+    /// Ingest every local Claude Code, Codex, OpenCode, pi, and omp session
+    /// from every project. Each event records its project, so `search
+    /// --project` and `writeback` still pull out one project's memory.
     BackfillAll {
-        /// Apply to the listed sources only. Defaults to `claude,codex,opencode`.
-        #[arg(long, value_delimiter = ',', default_values = &["claude", "codex", "opencode"])]
+        /// Apply to the listed sources only. Defaults to
+        /// `claude,codex,opencode,pi,omp`.
+        #[arg(long, value_delimiter = ',', default_values = &["claude", "codex", "opencode", "pi", "omp"])]
         source: Vec<String>,
         /// Show what would be ingested without writing anything.
         #[arg(long)]
@@ -429,14 +430,20 @@ pub enum Command {
     },
     /// Make agents use memory automatically: Claude Code hooks (preferences
     /// at session start, matching facts on every prompt, sync at session
-    /// end), the mem MCP server for Claude Code and Codex, and the /mem skill.
-    /// Backs up every file it edits; running it again changes nothing.
+    /// end), the mem MCP server for Claude Code, Codex, and omp, the /mem
+    /// skill, and a pi/omp extension that injects memory and exposes the
+    /// memory tools. Backs up every file it edits; running it again changes
+    /// nothing.
     Setup {
         #[arg(value_enum, default_value_t = SetupTarget::All)]
         target: SetupTarget,
         /// Undo what setup installed.
         #[arg(long)]
         remove: bool,
+        /// With `omp`: skip the MCP server, and expose memory through the
+        /// extension's own tools instead.
+        #[arg(long)]
+        no_mcp: bool,
     },
     /// Find facts that should not be in memory: duplicates, and facts that
     /// only described one session ("User is running X"). Lists them; with
@@ -454,6 +461,27 @@ pub enum Command {
     Hook {
         #[arg(value_enum)]
         event: HookArg,
+        /// Print only the context text, without the Claude Code
+        /// `hookSpecificOutput` JSON envelope. Used by the pi/omp extension.
+        #[arg(long)]
+        plain: bool,
+        /// With `--plain`: the session's working directory, instead of the
+        /// Claude hook JSON on stdin.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// With `--plain`: the user's prompt, for `mem hook prompt`.
+        #[arg(long)]
+        prompt: Option<String>,
+    },
+    /// Run one MCP operation and print its JSON payload. Hidden; used by the
+    /// pi/omp extension so its tools match the MCP toolset exactly.
+    #[command(hide = true)]
+    Op {
+        /// Operation name, e.g. `memory_search`.
+        operation: String,
+        /// Arguments as a JSON object on stdin, or inline with `--args`.
+        #[arg(long)]
+        args: Option<String>,
     },
     /// Manage the local reranker model used when no JEV key is set.
     Models {
@@ -486,6 +514,8 @@ pub enum SetupTarget {
     All,
     Claude,
     Codex,
+    Pi,
+    Omp,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -519,6 +549,7 @@ pub enum Adapter {
     Chat,
     Claude,
     Codex,
+    Pi,
     Markdown,
     Calendar,
     Voice,
@@ -711,27 +742,40 @@ pub fn run(cli: &Cli) -> Result<()> {
         }
         Command::Models { action } => cmd_models(cli, action),
         Command::Tidy { apply, keep } => cmd_tidy(cli, *apply, keep),
-        Command::Setup { target, remove } => {
+        Command::Setup { target, remove, no_mcp } => {
             let target = match target {
                 SetupTarget::All => crate::setup::Target::All,
                 SetupTarget::Claude => crate::setup::Target::Claude,
                 SetupTarget::Codex => crate::setup::Target::Codex,
+                SetupTarget::Pi => crate::setup::Target::Pi,
+                SetupTarget::Omp => crate::setup::Target::Omp,
             };
-            for line in crate::setup::run(target, *remove)? {
+            let options = crate::setup::Options { remove: *remove, no_mcp: *no_mcp };
+            for line in crate::setup::run(target, options)? {
                 println!("{line}");
             }
             Ok(())
         }
-        Command::Hook { event } => {
+        Command::Hook { event, plain, cwd, prompt } => {
             let event = match event {
                 HookArg::Start => crate::hook::HookEvent::Start,
                 HookArg::Prompt => crate::hook::HookEvent::Prompt,
                 HookArg::End => crate::hook::HookEvent::End,
                 HookArg::Sync => crate::hook::HookEvent::Sync,
             };
-            crate::hook::run(event, std::io::stdin().lock(), std::io::stdout().lock());
+            if *plain {
+                let payload = serde_json::json!({
+                    "cwd": cwd.as_ref().map(|p| p.display().to_string()),
+                    "prompt": prompt,
+                });
+                let bytes = serde_json::to_vec(&payload)?;
+                crate::hook::run(event, std::io::Cursor::new(bytes), std::io::stdout().lock(), true);
+            } else {
+                crate::hook::run(event, std::io::stdin().lock(), std::io::stdout().lock(), false);
+            }
             Ok(())
         }
+        Command::Op { operation, args } => cmd_op(cli, operation, args.as_deref()),
         Command::Bench {
             queries,
             iterations,
@@ -759,6 +803,8 @@ fn cmd_backfill_local(cli: &Cli, project: Option<&PathBuf>, dry_run: bool) -> Re
     let codex_root = home.join(".codex").join("sessions");
     let codex_archived = home.join(".codex").join("archived_sessions");
     let opencode_root = home.join(".local").join("share").join("opencode").join("storage");
+    let pi_root = pi_agent_dir(&home).join("sessions");
+    let omp_root = omp_agent_dir(&home).join("sessions");
 
     println!("Project filter: {}", canonical.display());
     println!("Roots:");
@@ -768,6 +814,8 @@ fn cmd_backfill_local(cli: &Cli, project: Option<&PathBuf>, dry_run: bool) -> Re
         ("Codex", &codex_root),
         ("Codex (archived)", &codex_archived),
         ("OpenCode", &opencode_root),
+        ("pi", &pi_root),
+        ("omp", &omp_root),
     ] {
         let status = if path.exists() { "present" } else { "absent" };
         println!("  [{label}] {status}  {}", path.display());
@@ -927,6 +975,43 @@ fn cmd_backfill_local(cli: &Cli, project: Option<&PathBuf>, dry_run: bool) -> Re
                 continue;
             }
             let adapter = crate::ingest::CodexAdapter;
+            match IngestAdapter::read(&adapter, &jsonl, &cli.scope, &cli.session) {
+                Ok(events) => {
+                    let n = events.len();
+                    for e in events {
+                        if journal.append(e)?.is_some() {
+                            ingested += 1;
+                        }
+                    }
+                    println!("  {}: {} events", jsonl.display(), n);
+                }
+                Err(err) => {
+                    eprintln!("  {}: {err}", jsonl.display());
+                    skipped += 1;
+                }
+            }
+        }
+    }
+
+    // pi and omp: session files live under `<agent>/sessions/<encoded>/`.
+    // The header carries the session's cwd, which is the reliable filter.
+    for (label, root) in [("pi", &pi_root), ("omp", &omp_root)] {
+        if !root.exists() {
+            continue;
+        }
+        println!("[{label}] scanning {}", root.display());
+        for jsonl in walk_session_files(root) {
+            let Some(cwd) = crate::ingest::pi_session_cwd(&jsonl) else {
+                continue;
+            };
+            if !paths_match(Path::new(&cwd), &canonical) {
+                continue;
+            }
+            if dry_run {
+                println!("  would ingest: {}", jsonl.display());
+                continue;
+            }
+            let adapter = crate::ingest::PiAdapter;
             match IngestAdapter::read(&adapter, &jsonl, &cli.scope, &cli.session) {
                 Ok(events) => {
                     let n = events.len();
@@ -1219,6 +1304,34 @@ fn walk_jsonl_in(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Session files directly under `sessions/<project>/`. pi and omp put the
+/// user's transcript there and any advisor/worker sidecars in a sibling
+/// directory named after the session, so only this top level is real
+/// conversation; the rest is agent-to-agent and the parent already covers it.
+fn walk_session_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(projects) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for project in projects.flatten() {
+        let dir = project.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 fn walk_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -1256,10 +1369,14 @@ fn cmd_backfill_all(cli: &Cli, sources: &[String], dry_run: bool) -> Result<()> 
         home.join(".codex").join("archived_sessions"),
     ];
     let opencode_root = home.join(".local").join("share").join("opencode").join("storage");
+    let pi_root = pi_agent_dir(&home).join("sessions");
+    let omp_root = omp_agent_dir(&home).join("sessions");
 
     let want_claude = sources.iter().any(|s| s == "claude");
     let want_codex = sources.iter().any(|s| s == "codex");
     let want_opencode = sources.iter().any(|s| s == "opencode");
+    let want_pi = sources.iter().any(|s| s == "pi");
+    let want_omp = sources.iter().any(|s| s == "omp");
 
     // ----- Phase 1: collect every candidate file in a fast sequential walk.
     let mut claude_files: Vec<(String, PathBuf)> = Vec::new();
@@ -1312,6 +1429,17 @@ fn cmd_backfill_all(cli: &Cli, sources: &[String], dry_run: bool) -> Result<()> 
         }
     }
 
+    let mut pi_files: Vec<PathBuf> = Vec::new();
+    if want_pi && pi_root.exists() {
+        println!("[pi] scanning {}", pi_root.display());
+        pi_files = walk_session_files(&pi_root);
+    }
+    let mut omp_files: Vec<PathBuf> = Vec::new();
+    if want_omp && omp_root.exists() {
+        println!("[omp] scanning {}", omp_root.display());
+        omp_files = walk_session_files(&omp_root);
+    }
+
     let mut opencode_sessions: Vec<(String, PathBuf)> = Vec::new(); // (sid, session.json path)
     if want_opencode && opencode_root.exists() {
         println!("[OpenCode] scanning {}", opencode_root.display());
@@ -1354,6 +1482,8 @@ fn cmd_backfill_all(cli: &Cli, sources: &[String], dry_run: bool) -> Result<()> 
         println!("\nDry run summary:");
         println!("  Claude Code files: {}", claude_files.len());
         println!("  Codex files:       {}", codex_files.len());
+        println!("  pi files:          {}", pi_files.len());
+        println!("  omp files:         {}", omp_files.len());
         println!("  OpenCode sessions: {}", opencode_sessions.len());
         return Ok(());
     }
@@ -1432,6 +1562,39 @@ fn cmd_backfill_all(cli: &Cli, sources: &[String], dry_run: bool) -> Result<()> 
         }
         ingested += codex_ingested;
         skipped += codex_skipped;
+    }
+
+    let pi_all: Vec<PathBuf> = pi_files.into_iter().chain(omp_files).collect();
+    if !pi_all.is_empty() {
+        let total = pi_all.len();
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        let parsed: Vec<Option<Vec<crate::journal::JournalEvent>>> = pi_all
+            .par_iter()
+            .map(|path| {
+                let done = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if done.is_multiple_of(200) || done == total {
+                    eprintln!("  [pi/omp] {done}/{total} files");
+                }
+                let adapter = crate::ingest::PiAdapter;
+                IngestAdapter::read(&adapter, path, &cli.scope, &cli.session).ok()
+            })
+            .collect();
+        let mut pi_ingested = 0usize;
+        let mut pi_skipped = 0usize;
+        for item in parsed {
+            match item {
+                Some(events) => {
+                    for e in events {
+                        if writer.append(e)?.is_some() {
+                            pi_ingested += 1;
+                        }
+                    }
+                }
+                None => pi_skipped += 1,
+            }
+        }
+        ingested += pi_ingested;
+        skipped += pi_skipped;
     }
 
     if want_opencode && !opencode_sessions.is_empty() {
@@ -1702,6 +1865,7 @@ fn cmd_formats() -> Result<()> {
     println!("Source formats accepted by `mem ingest` and `mem backfill`:");
     println!("  .jsonl           claude_code       Claude Code transcripts (detected by content)");
     println!("  .jsonl           codex             Codex rollouts (detected by content)");
+    println!("  .jsonl           pi                pi / omp sessions (detected by content)");
     println!("  .jsonl / .json   chat_export       one JSON object per line");
     println!("                                     fields: id, role, text, ts?, redaction?");
     println!("  .ics             calendar          iCalendar (RFC 5545) feeds");
@@ -1719,6 +1883,11 @@ fn cmd_formats() -> Result<()> {
     println!("  ~/.claude/projects, ~/.claude/archived_projects          Claude Code");
     println!("  ~/.codex/sessions, ~/.codex/archived_sessions            Codex");
     println!("  ~/.local/share/opencode/storage                          OpenCode");
+    println!("  ~/.pi/agent/sessions                                     pi");
+    println!("  ~/.omp/agent/sessions                                    omp");
+    println!();
+    println!("Overrides: MEM_PI_AGENT_DIR / PI_CODING_AGENT_DIR for pi,");
+    println!("           MEM_OMP_AGENT_DIR for omp (the folder above `sessions/`).");
     Ok(())
 }
 
@@ -2130,6 +2299,57 @@ fn cmd_init(root: &PathBuf, store: StoreKind) -> Result<()> {
     Ok(())
 }
 
+/// Run one MCP operation (the hidden `mem op` command) and print its JSON
+/// payload. The pi/omp extension calls this so its native tools behave
+/// exactly like the MCP tools: same operations, same arguments, same result.
+fn cmd_op(cli: &Cli, operation: &str, args: Option<&str>) -> Result<()> {
+    let raw = match args {
+        Some(a) => a.to_string(),
+        None => {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .map_err(|e| Error::io("stdin", e))?;
+            buf
+        }
+    };
+    let args: serde_json::Value = if raw.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(raw.trim())
+            .map_err(|e| Error::Usage(format!("arguments are not valid JSON: {e}")))?
+    };
+    let result = crate::ops::execute(&cli.root, &cli.scope, &cli.session, operation, &args);
+    println!("{}", result.payload);
+    if let Some(err) = result.error {
+        return Err(Error::Usage(err));
+    }
+    if result.not_found || result.conflict {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// pi's agent directory: `$MEM_PI_AGENT_DIR`, else `$PI_CODING_AGENT_DIR`,
+/// else `~/.pi/agent`. Sessions live in its `sessions/` subdirectory.
+fn pi_agent_dir(home: &Path) -> PathBuf {
+    for key in ["MEM_PI_AGENT_DIR", "PI_CODING_AGENT_DIR"] {
+        if let Some(v) = std::env::var_os(key).filter(|v| !v.is_empty()) {
+            return PathBuf::from(v);
+        }
+    }
+    home.join(".pi").join("agent")
+}
+
+/// omp's agent directory: `$MEM_OMP_AGENT_DIR`, else `~/.omp/agent`.
+fn omp_agent_dir(home: &Path) -> PathBuf {
+    if let Some(v) = std::env::var_os("MEM_OMP_AGENT_DIR").filter(|v| !v.is_empty()) {
+        return PathBuf::from(v);
+    }
+    home.join(".omp").join("agent")
+}
+
 /// Tag events that do not name a project with the one given on the command line.
 fn tag_project(events: &mut [JournalEvent], project: Option<&Path>) {
     if let Some(project) = project {
@@ -2149,6 +2369,7 @@ fn cmd_ingest(cli: &Cli, files: &[PathBuf], format: Option<Adapter>, project: Op
             Some(Adapter::Chat) => Box::new(ChatExportAdapter),
             Some(Adapter::Claude) => Box::new(ClaudeAdapter),
             Some(Adapter::Codex) => Box::new(CodexAdapter),
+            Some(Adapter::Pi) => Box::new(PiAdapter),
             Some(Adapter::Markdown) => Box::new(crate::ingest::MarkdownAdapter),
             Some(Adapter::Calendar) => Box::new(crate::ingest::CalendarAdapter),
             Some(Adapter::Voice) => Box::new(crate::ingest::VoiceAdapter),

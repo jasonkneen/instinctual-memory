@@ -37,16 +37,18 @@ pub enum HookEvent {
 }
 
 /// Run a hook. Errors are swallowed (and printed only with MEM_HOOK_DEBUG=1)
-/// so a memory problem never blocks the agent.
-pub fn run(event: HookEvent, input: impl Read, output: impl Write) {
-    if let Err(err) = run_inner(event, input, output) {
+/// so a memory problem never blocks the agent. With `plain`, context is
+/// printed as bare text instead of the Claude Code `hookSpecificOutput`
+/// envelope, which is what the pi/omp extension consumes.
+pub fn run(event: HookEvent, input: impl Read, output: impl Write, plain: bool) {
+    if let Err(err) = run_inner(event, input, output, plain) {
         if std::env::var("MEM_HOOK_DEBUG").is_ok_and(|v| v == "1") {
             eprintln!("mem hook: {err}");
         }
     }
 }
 
-fn run_inner(event: HookEvent, mut input: impl Read, mut output: impl Write) -> Result<()> {
+fn run_inner(event: HookEvent, mut input: impl Read, mut output: impl Write, plain: bool) -> Result<()> {
     let mut raw = String::new();
     if event != HookEvent::Sync {
         input.read_to_string(&mut raw).map_err(|e| crate::error::Error::io("stdin", e))?;
@@ -73,9 +75,13 @@ fn run_inner(event: HookEvent, mut input: impl Read, mut output: impl Write) -> 
         }
     };
     if let Some(text) = context {
-        let name = if event == HookEvent::Start { "SessionStart" } else { "UserPromptSubmit" };
-        let out = json!({"hookSpecificOutput": {"hookEventName": name, "additionalContext": text}});
-        writeln!(output, "{out}").map_err(|e| crate::error::Error::io("stdout", e))?;
+        if plain {
+            write!(output, "{text}").map_err(|e| crate::error::Error::io("stdout", e))?;
+        } else {
+            let name = if event == HookEvent::Start { "SessionStart" } else { "UserPromptSubmit" };
+            let out = json!({"hookSpecificOutput": {"hookEventName": name, "additionalContext": text}});
+            writeln!(output, "{out}").map_err(|e| crate::error::Error::io("stdout", e))?;
+        }
     }
     Ok(())
 }
