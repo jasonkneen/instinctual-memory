@@ -8,8 +8,11 @@
 //! Configuration (environment, else the nearest `.env` defining a key within
 //! four parent folders, else `~/.config/mem/env`):
 //! - `MEM_JEV_API_KEY` or `OPENROUTER_API_KEY`: bearer token.
-//! - `OPENROUTER_DECISIONS_BASE_URL` / `MEM_JEV_DECISIONS_URL` /
-//!   `MEM_JEV_BASE_URL`: endpoint, default
+//! - `MEM_JEV_BASE_URL`: the exact JEV endpoint, used verbatim. This is the
+//!   knob for a self-hosted or proxied JEV that lives at its own path, where
+//!   appending `/alpha/decisions` would miss the route.
+//! - `OPENROUTER_DECISIONS_BASE_URL`: an OpenRouter API root;
+//!   `/alpha/decisions` is appended unless it is already there. Default
 //!   `https://openrouter.ai/api/alpha/decisions`.
 //! - `MEM_JEV_MODEL` or `JEV_MODEL`: default `~typesafe/jev-latest`.
 //! - `MEM_JEV_DOTENV_PATH`: read this file instead of searching for one.
@@ -64,28 +67,46 @@ impl JevReranker {
         }
     }
 
+    /// Construct with an exact decisions endpoint, used as-is. Use this for a
+    /// proxy that serves JEV at its own path, where appending
+    /// `/alpha/decisions` would miss the route.
+    pub fn new_endpoint(
+        decisions_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            decisions_url: decisions_url.into().trim().trim_end_matches('/').to_string(),
+            api_key: api_key.into(),
+            model: model.into(),
+        }
+    }
+
     /// Construct from the environment. Loads `.env` from `MEM_JEV_DOTENV_PATH`
     /// or the nearest `.env` that defines a JEV key.
     ///
     /// Key: `MEM_JEV_API_KEY` or `OPENROUTER_API_KEY`.
-    /// URL: `OPENROUTER_DECISIONS_BASE_URL`, `MEM_JEV_DECISIONS_URL`, or
-    /// `MEM_JEV_BASE_URL`. Default `https://openrouter.ai/api/alpha/decisions`.
+    /// Endpoint: `MEM_JEV_BASE_URL` is used verbatim; otherwise
+    /// `OPENROUTER_DECISIONS_BASE_URL` gets `/alpha/decisions` appended.
+    /// Default `https://openrouter.ai/api/alpha/decisions`.
     /// Model: `MEM_JEV_MODEL` or `JEV_MODEL`. Default `~typesafe/jev-latest`.
     pub fn from_env() -> Result<Self> {
         load_jev_dotenv();
-        let decisions_url = first_nonempty(&[
-            "OPENROUTER_DECISIONS_BASE_URL",
-            "MEM_JEV_DECISIONS_URL",
-            "MEM_JEV_BASE_URL",
-        ])
-        .unwrap_or_else(|| DEFAULT_DECISIONS_URL.to_string());
-        let api_key = first_nonempty(&["MEM_JEV_API_KEY", "OPENROUTER_API_KEY"])
-            .ok_or_else(|| Error::Jev(
-                "no API key: set MEM_JEV_API_KEY or OPENROUTER_API_KEY".into(),
-            ))?;
+        let api_key = first_nonempty(&["MEM_JEV_API_KEY", "OPENROUTER_API_KEY"]).ok_or_else(|| {
+            Error::Jev("no API key: set MEM_JEV_API_KEY or OPENROUTER_API_KEY".into())
+        })?;
         let model = first_nonempty(&["MEM_JEV_MODEL", "JEV_MODEL"])
             .unwrap_or_else(|| DEFAULT_MODEL.to_string());
-        Ok(Self::new(decisions_url, api_key, model))
+        // `MEM_JEV_BASE_URL` is the exact endpoint: a self-hosted or proxied
+        // JEV lives at its own path, and appending `/alpha/decisions` would
+        // miss it. `OPENROUTER_DECISIONS_BASE_URL` is an OpenRouter API root,
+        // so it gets the decisions path appended.
+        if let Some(endpoint) = first_nonempty(&["MEM_JEV_BASE_URL"]) {
+            return Ok(Self::new_endpoint(endpoint, api_key, model));
+        }
+        let base = first_nonempty(&["OPENROUTER_DECISIONS_BASE_URL"])
+            .unwrap_or_else(|| DEFAULT_DECISIONS_URL.to_string());
+        Ok(Self::new(base, api_key, model))
     }
 
     pub fn model(&self) -> &str {
@@ -321,6 +342,17 @@ mod tests {
             normalize_decisions_url("https://openrouter.ai/api/v1/"),
             "https://openrouter.ai/api/v1/alpha/decisions"
         );
+    }
+
+    #[test]
+    fn exact_endpoint_is_not_normalized() {
+        // A proxy that serves JEV at its own path must be hit verbatim.
+        let jev = JevReranker::new_endpoint(
+            "https://proxy.example.test/jev/v1/systemone/",
+            "test-token",
+            "jev-latest",
+        );
+        assert_eq!(jev.base_url(), "https://proxy.example.test/jev/v1/systemone");
     }
 
     #[test]

@@ -396,6 +396,96 @@ fn hooks_inject_relevant_memory_and_stay_silent_otherwise() {
     // No store anywhere: silent success, not an error.
     let none = hook(&elsewhere, "prompt", serde_json::json!({"cwd": elsewhere.display().to_string(), "prompt": "how does the backend deploy?"}));
     assert!(none.trim().is_empty());
+    // Plain (pi/omp) output is bare text, without the Claude envelope.
+    let plain = mem_in(&project)
+        .args(["hook", "prompt", "--plain", "--cwd"])
+        .arg(&project)
+        .args(["--prompt", "how does the backend deploy?"])
+        .assert()
+        .success();
+    let plain = String::from_utf8_lossy(&plain.get_output().stdout).to_string();
+    assert!(plain.contains("fly deploy"), "{plain}");
+    assert!(!plain.trim_start().starts_with('{'), "{plain}");
     // Garbage payload: still silent success.
     mem_in(&project).args(["hook", "prompt"]).write_stdin("not json").assert().success();
+}
+
+#[test]
+fn backfills_pi_and_omp_sessions_and_runs_operations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let root = tmp.path().join("mem");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(home.join(".pi/agent/sessions/--x--")).unwrap();
+    std::fs::create_dir_all(home.join(".omp/agent/sessions/--x--")).unwrap();
+    let cwd = project.display().to_string();
+    let session = |harness: &str| {
+        [
+            serde_json::json!({"type":"title","v":1,"title":"Work"}),
+            serde_json::json!({"type":"session","version":3,"id":format!("{harness}-s"),"cwd":cwd}),
+            serde_json::json!({"type":"message","id":"u1","parentId":null,"message":{"role":"user","content":[{"type":"text","text":"We deploy with fly"}]}}),
+            serde_json::json!({"type":"message","id":"a1","parentId":"u1","message":{"role":"assistant","content":[{"type":"thinking","thinking":"x"},{"type":"text","text":"Noted."},{"type":"toolCall","name":"bash","arguments":{}}]}}),
+        ]
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+            + "\n"
+    };
+    std::fs::write(home.join(".pi/agent/sessions/--x--/pi.jsonl"), session("pi")).unwrap();
+    std::fs::write(home.join(".omp/agent/sessions/--x--/omp.jsonl"), session("omp")).unwrap();
+    // pi/omp keep advisor and worker sidecars in a sibling directory named
+    // after the session. They are agent-to-agent and must be skipped.
+    let sidecar_dir = home.join(".pi/agent/sessions/--x--/pi-s");
+    std::fs::create_dir_all(&sidecar_dir).unwrap();
+    std::fs::write(sidecar_dir.join("__advisor.jsonl"), session("advisor")).unwrap();
+    std::fs::write(sidecar_dir.join("worker.jsonl"), session("worker")).unwrap();
+
+    mem(&root).arg("init").assert().success();
+    Command::cargo_bin("mem")
+        .unwrap()
+        .env("HOME", &home)
+        .env("MEM_PI_AGENT_DIR", home.join(".pi/agent"))
+        .env("MEM_OMP_AGENT_DIR", home.join(".omp/agent"))
+        .env("MEM_RERANK", "off")
+        .arg("--root")
+        .arg(&root)
+        .args(["backfill-local", "--project"])
+        .arg(&project)
+        .assert()
+        .success();
+
+    let status = json(&mem(&root).arg("status").assert().success().get_output().stdout);
+    // Thinking and tool calls are dropped: two text messages per session.
+    // The two sidecar files in the sibling directory are skipped.
+    assert_eq!(status["journal"]["events"], 4);
+    assert_eq!(status["journal"]["projects"][0], "proj");
+
+    // The hidden `mem op` runs the same operations as the MCP server.
+    let found = json(
+        &mem(&root)
+            .args(["op", "memory_search", "--args", r#"{"query":"deploy","rerank":false}"#])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    );
+    assert!(!found["hits"].as_array().unwrap().is_empty());
+
+    // Re-running the backfill adds nothing (stable ids for both harnesses).
+    let again = Command::cargo_bin("mem")
+        .unwrap()
+        .env("HOME", &home)
+        .env("MEM_PI_AGENT_DIR", home.join(".pi/agent"))
+        .env("MEM_OMP_AGENT_DIR", home.join(".omp/agent"))
+        .env("MEM_RERANK", "off")
+        .arg("--root")
+        .arg(&root)
+        .args(["backfill-local", "--project"])
+        .arg(&project)
+        .assert()
+        .success();
+    let status = json(&mem(&root).arg("status").assert().success().get_output().stdout);
+    assert_eq!(status["journal"]["events"], 4, "{}", String::from_utf8_lossy(&again.get_output().stdout));
 }
