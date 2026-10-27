@@ -21,6 +21,12 @@ use crate::paths::{
     receipt_path, request_id as validate_request_id, revision_id, PathRules, MEMORY_REF,
 };
 
+/// Upper bound on one published change batch. Consolidation may legitimately
+/// rewrite up to 60 entities of ~56 KiB each, plus `INDEX.md` and the
+/// dispositions, so the cap has to clear that; it only bounds a single commit
+/// and the in-memory digest, it is not meant to police normal batches.
+const MAX_CHANGE_BYTES: usize = 8 * 1024 * 1024;
+
 /// Conflict during publication. The caller should reconcile and retry.
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -206,10 +212,11 @@ impl GitRepo {
 
         // Compute the change digest for replay detection.
         let payload = serde_json::to_vec(&changes.canonical(base))?;
-        if payload.len() > 262_144 {
-            return Err(Error::BadChangeBatch(
-                "change batch exceeds 256 KiB budget".into(),
-            ));
+        if payload.len() > MAX_CHANGE_BYTES {
+            return Err(Error::BadChangeBatch(format!(
+                "change batch exceeds {} MiB budget",
+                MAX_CHANGE_BYTES / (1024 * 1024)
+            )));
         }
         let mut hasher = Sha256::new();
         hasher.update(&payload);
