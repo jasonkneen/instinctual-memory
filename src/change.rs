@@ -13,6 +13,7 @@ use crate::error::{Error, Result};
 use crate::fact::Fact;
 use crate::paths::{request_id as validate_request_id, revision_id};
 use crate::repo::{Change, ChangeSet, GitRepo, Intent};
+use crate::consolidate::{blank_entity, ENTITY_SOFT_LIMIT};
 use crate::validate::DomainValidator;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -99,21 +100,48 @@ pub fn apply_against_base(
     request.validate()?;
     revision_id(base)?;
 
-    let entity_path = entity_path_for(&request.entity_id, &request.scope_id)?;
-    let current = repo
-        .read_snapshot(base, &entity_path)?
-        .map(|b| EntityFile::parse(&b.content))
-        .transpose()?;
+    let controls_path = "state/controls.json";
+    let mut controls = repo
+        .read_snapshot(base, controls_path)?
+        .map(|b| Controls::parse(&b.content))
+        .transpose()?
+        .unwrap_or_default();
+    let family = load_family(repo, base, &request.entity_id)?;
+    // The fact this request is about, if it already lives in the entity or
+    // one of its spill files (`<id>_2`, ...).
+    let about = match request.kind {
+        ChangeKind::Remember => request.fact.as_ref().map(|f| f.id.clone()),
+        _ => request
+            .target_fact_id
+            .clone()
+            .or_else(|| request.fact.as_ref().map(|f| f.id.clone())),
+    };
+    let holder = about
+        .as_deref()
+        .and_then(|id| family.iter().position(|(_, e)| e.facts.iter().any(|f| f.id == id)));
 
-    let (new_entity, affected_controls, affected_checkpoint) = match request.kind {
+    let (entity_id, new_entity, affected_controls, affected_checkpoint) = match request.kind {
         ChangeKind::Remember => {
-            let mut entity = current.unwrap_or_else(|| new_entity(&request.entity_id));
             let fact = request.fact.clone().expect("validated");
+            // Upsert where the fact already is; otherwise the first file of the
+            // family with room, or a new spill file once they are all full.
+            let (id, mut entity) = match holder {
+                Some(i) => family[i].clone(),
+                None => family
+                    .iter()
+                    .find(|(_, e)| {
+                        let mut pruned = e.clone();
+                        pruned.prune_forgotten(&controls);
+                        pruned.render().len() + fact.statement.len() + 600 <= ENTITY_SOFT_LIMIT
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| next_spill(&request.entity_id, &family)),
+            };
             entity.upsert_fact(fact);
-            (entity, None, None)
+            (id, entity, None, None)
         }
         ChangeKind::Correct => {
-            let Some(mut entity) = current else {
+            let Some((id, mut entity)) = holder.map(|i| family[i].clone()).or_else(|| family.first().cloned()) else {
                 return Err(Error::InvalidChange(format!(
                     "correct: entity {} does not exist",
                     request.entity_id
@@ -126,10 +154,10 @@ pub fn apply_against_base(
                 .unwrap_or_else(|| new_fact.id.clone());
             entity.supersede(&old_id, &new_fact.id)?;
             entity.upsert_fact(new_fact.clone());
-            (entity, None, None)
+            (id, entity, None, None)
         }
         ChangeKind::Forget => {
-            let Some(mut entity) = current else {
+            let Some((id, mut entity)) = holder.map(|i| family[i].clone()).or_else(|| family.first().cloned()) else {
                 return Err(Error::InvalidChange(format!(
                     "forget: entity {} does not exist",
                     request.entity_id
@@ -138,13 +166,7 @@ pub fn apply_against_base(
             let target = request.target_fact_id.clone().expect("validated");
             entity.retract(&target)?;
 
-            // Load or build the controls and add the suppression record.
-            let controls_path = "state/controls.json";
-            let mut controls = repo
-                .read_snapshot(base, controls_path)?
-                .map(|b| Controls::parse(&b.content))
-                .transpose()?
-                .unwrap_or_default();
+            // The suppression record hides the fact and blocks re-extraction.
             controls.add_suppression(crate::controls::Suppression {
                 target: target.clone(),
                 kind: crate::controls::SuppressionKind::SoftForget,
@@ -152,13 +174,17 @@ pub fn apply_against_base(
                 reason: request.reason.clone(),
             });
             controls.add_retraction(target.clone());
-            (entity, Some((controls_path.to_string(), controls.render()?)), None)
+            (id, entity, Some((controls_path.to_string(), controls.render()?)), None)
         }
     };
+    let entity_path = entity_path_for(&entity_id, &request.scope_id)?;
+    // Forgotten facts are dropped from the file as it is written, so a full
+    // entity frees up; Git history keeps their text.
+    let mut new_entity = new_entity;
+    new_entity.prune_forgotten(&controls);
 
     // Build the change set: entity, INDEX.md, controls (if any), and
     // checkpoint (if any).
-    let mut new_entity = new_entity;
     new_entity.refresh_body();
     let index_md = crate::index::index_md_after(
         repo,
@@ -195,6 +221,29 @@ pub fn apply_against_base(
         change_kind: request.kind,
         target_id,
     })
+}
+
+/// The entity and its spill files (`<id>_2`, `<id>_3`, ...) in order. A
+/// missing base file yields a fresh entity, so a first remember creates it.
+fn load_family(repo: &GitRepo, base: &str, entity_id: &str) -> Result<Vec<(String, EntityFile)>> {
+    let mut family = Vec::new();
+    for n in 1..=50 {
+        let id = if n == 1 { entity_id.to_string() } else { format!("{entity_id}_{n}") };
+        match repo.read_snapshot(base, &entity_path_for(&id, "")?)? {
+            Some(blob) => family.push((id, EntityFile::parse(&blob.content)?)),
+            None if n == 1 => family.push((id.clone(), new_entity(&id))),
+            None => break,
+        }
+    }
+    Ok(family)
+}
+
+/// A new, empty spill file after the last one in `family`.
+fn next_spill(entity_id: &str, family: &[(String, EntityFile)]) -> (String, EntityFile) {
+    let id = format!("{entity_id}_{}", family.len() + 1);
+    let base = &family[0].1;
+    let entity = blank_entity(&id, &base.entity_type, &base.title);
+    (id, entity)
 }
 
 fn new_entity(id: &str) -> EntityFile {
@@ -489,5 +538,70 @@ mod tests {
             "y",
             crate::journal::Redaction::None,
         );
+    }
+
+    fn read_entity(repo: &GitRepo, path: &str) -> Option<EntityFile> {
+        let head = repo.head().unwrap();
+        repo.read_snapshot(&head, path).unwrap().map(|b| EntityFile::parse(&b.content).unwrap())
+    }
+
+    fn forget_request(id: &str, entity: &str, target: &str) -> ChangeRequest {
+        ChangeRequest {
+            kind: ChangeKind::Forget,
+            request_id: id.into(),
+            scope_id: "personal".into(),
+            session_id: "s".into(),
+            source_event_id: "evt_f".into(),
+            entity_id: entity.into(),
+            fact: None,
+            target_fact_id: Some(target.into()),
+            reason: Some("test".into()),
+            proposed_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn remember_spills_into_the_next_file_when_the_entity_is_full() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = GitRepo::create(tmp.path()).unwrap();
+        let long = "Alex keeps a detailed note about the project. ".repeat(40);
+        let mut n = 0;
+        while read_entity(&repo, "memory/people/alex_2.md").is_none() {
+            n += 1;
+            assert!(n < 200, "never spilled");
+            apply(&repo, remember_request(&format!("r{n}"), &format!("{n}: {long}"))).unwrap();
+        }
+        let base = read_entity(&repo, "memory/people/alex.md").unwrap();
+        assert!(base.render().len() <= ENTITY_SOFT_LIMIT, "the base file stays under the limit");
+        let spill = read_entity(&repo, "memory/people/alex_2.md").unwrap();
+        assert_eq!(spill.id, "p_alex_2");
+        assert_eq!(spill.facts.len(), 1);
+
+        // Re-remembering a fact updates it where it already lives.
+        let again = remember_request(&format!("r{n}"), "updated");
+        apply(&repo, ChangeRequest { request_id: "again".into(), ..again }).unwrap();
+        let spill = read_entity(&repo, "memory/people/alex_2.md").unwrap();
+        assert_eq!(spill.facts[0].statement, "updated");
+
+        // Correct and forget find a fact in a spill file.
+        apply(&repo, forget_request("f_spill", "p_alex", &format!("fact_r{n}"))).unwrap();
+        let spill = read_entity(&repo, "memory/people/alex_2.md").unwrap();
+        assert!(spill.facts.is_empty(), "the forgotten fact is pruned from its spill file");
+    }
+
+    #[test]
+    fn forgotten_facts_free_their_room() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = GitRepo::create(tmp.path()).unwrap();
+        apply(&repo, remember_request("keep", "Alex likes tea.")).unwrap();
+        apply(&repo, remember_request("drop", &"Alex once said something long. ".repeat(50))).unwrap();
+        let before = read_entity(&repo, "memory/people/alex.md").unwrap().render().len();
+        apply(&repo, forget_request("f1", "p_alex", "fact_drop")).unwrap();
+        let entity = read_entity(&repo, "memory/people/alex.md").unwrap();
+        assert!(entity.render().len() < before / 2, "the file shrinks");
+        assert_eq!(entity.facts.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["fact_keep"]);
+        let head = repo.head().unwrap();
+        let controls = Controls::parse(&repo.read_snapshot(&head, "state/controls.json").unwrap().unwrap().content).unwrap();
+        assert!(controls.is_suppressed("fact_drop"), "still hidden and blocked from re-extraction");
     }
 }

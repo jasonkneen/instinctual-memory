@@ -127,6 +127,17 @@ impl EntityFile {
         Ok(())
     }
 
+    /// Drop facts that were forgotten: suppressed and retracted in controls.
+    /// The suppression keeps them hidden from every read and blocks
+    /// re-extraction, and Git history keeps their text, so the live file does
+    /// not carry them. Returns true when anything was dropped.
+    pub fn prune_forgotten(&mut self, controls: &crate::controls::Controls) -> bool {
+        let before = self.facts.len();
+        self.facts
+            .retain(|f| !(controls.is_suppressed(&f.id) && controls.is_retracted(&f.id)));
+        self.facts.len() != before
+    }
+
     /// Mark an existing fact as retracted.
     pub fn retract(&mut self, fact_id: &str) -> Result<()> {
         for fact in &mut self.facts {

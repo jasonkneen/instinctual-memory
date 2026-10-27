@@ -111,6 +111,11 @@ impl Validator for DomainValidator {
                 if controls.is_deleted(target) {
                     continue;
                 }
+                // A forgotten fact (suppressed and retracted) is pruned from
+                // its entity file; the suppression is what keeps it hidden.
+                if controls.is_retracted(target) {
+                    continue;
+                }
                 if !known.iter().any(|k| k == target) {
                     // Allow references to known entity ids too.
                     if !entities.iter().any(|e| e.id == *target) {

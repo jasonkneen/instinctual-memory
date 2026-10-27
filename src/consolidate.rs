@@ -87,7 +87,7 @@ struct Extraction {
 /// Commits are capped at 64 files; leave room for checkpoint + dispositions.
 const MAX_ENTITY_CHANGES: usize = 60;
 /// Entity files must stay under the 64 KiB read limit.
-const ENTITY_SOFT_LIMIT: usize = 56_000;
+pub(crate) const ENTITY_SOFT_LIMIT: usize = 56_000;
 
 pub struct Consolidator;
 
@@ -150,6 +150,14 @@ impl Consolidator {
             .keys()
             .cloned()
             .chain(controls.deletions.iter().map(|d| d.target.clone()))
+            .collect();
+        // Forgotten facts take no room: a full entity frees up when they go.
+        let existing: BTreeMap<String, EntityFile> = existing
+            .into_iter()
+            .map(|(id, mut entity)| {
+                entity.prune_forgotten(&controls);
+                (id, entity)
+            })
             .collect();
         let mut extraction = match extractor {
             ExtractorKind::Llm => llm_extract(existing, blocked, &bounded)?,
@@ -486,7 +494,7 @@ fn fact_role(role: Role) -> FactRole {
     }
 }
 
-fn blank_entity(id: &str, entity_type: &str, title: &str) -> EntityFile {
+pub(crate) fn blank_entity(id: &str, entity_type: &str, title: &str) -> EntityFile {
     EntityFile {
         schema_version: 2,
         id: id.to_string(),

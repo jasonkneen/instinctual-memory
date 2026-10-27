@@ -2461,7 +2461,11 @@ fn cmd_tidy(cli: &Cli, apply: bool, keep: &[String]) -> Result<()> {
         println!("  [{}] {}  (same as {})", f.fact_id, f.statement, f.duplicate_of.as_deref().unwrap_or(""));
     }
     match &report.applied_at {
-        Some(rev) => println!("\nForgot {} fact(s) at {rev}.", report.findings.len()),
+        Some(rev) => println!(
+            "\nForgot {} fact(s); removed {} forgotten fact(s) from their files, at {rev}.",
+            report.findings.len(),
+            report.compacted
+        ),
         None if report.findings.is_empty() => println!("\nNothing to tidy."),
         None => println!(
             "\nNothing changed. Run `mem tidy --apply` to forget these {} fact(s) (add `--keep id,id` for any to leave).",

@@ -45,9 +45,11 @@ pub struct TidyReport {
     pub findings: Vec<Finding>,
     /// False when no LLM key is set: only duplicates were checked.
     pub checked_session_only: bool,
-    /// Head after `--apply`, if anything was forgotten.
+    /// Head after `--apply`, if anything was forgotten or compacted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub applied_at: Option<String>,
+    /// Facts forgotten earlier that `--apply` removed from their files.
+    pub compacted: usize,
 }
 
 const JUDGE_PROMPT: &str = r#"You review facts stored in a coding agent's long-term memory.
@@ -132,8 +134,14 @@ pub fn tidy(repo: &GitRepo, apply: bool, keep: &[String]) -> Result<TidyReport> 
                 .iter()
                 .map(|(_, id, s)| serde_json::json!({"id": id, "statement": s}))
                 .collect();
-            let judged: Judgement = chat_json(cfg, JUDGE_PROMPT, &serde_json::json!({"facts": facts}).to_string())?;
-            let ids: BTreeSet<&str> = judged.session_only.iter().map(String::as_str).collect();
+            // Two passes, the second in reverse order; only facts both passes
+            // call session-only are flagged. One pass alone flips on borderline
+            // facts whenever the batch changes, and forgetting is not undone
+            // by re-running.
+            let first: Judgement = chat_json(cfg, JUDGE_PROMPT, &serde_json::json!({"facts": facts}).to_string())?;
+            let reversed: Vec<&serde_json::Value> = facts.iter().rev().collect();
+            let second: Judgement = chat_json(cfg, JUDGE_PROMPT, &serde_json::json!({"facts": reversed}).to_string())?;
+            let ids = agreed(&first.session_only, &second.session_only);
             for (entity_id, fact_id, statement) in batch {
                 if ids.contains(fact_id.as_str()) && flagged.insert(fact_id.clone()) {
                     findings.push(Finding {
@@ -154,11 +162,23 @@ pub fn tidy(repo: &GitRepo, apply: bool, keep: &[String]) -> Result<TidyReport> 
         findings,
         checked_session_only: cfg.is_some(),
         applied_at: None,
+        compacted: 0,
     };
-    if apply && !report.findings.is_empty() {
+    // Facts forgotten earlier still take room in their files until pruned.
+    let prunable: usize = entities
+        .values()
+        .map(|(_, e)| e.facts.iter().filter(|f| controls.is_suppressed(&f.id) && controls.is_retracted(&f.id)).count())
+        .sum();
+    report.compacted = if apply { prunable } else { 0 };
+    if apply && (!report.findings.is_empty() || prunable > 0) {
         report.applied_at = Some(forget_all(repo, &head, entities, controls, &report.findings)?);
     }
     Ok(report)
+}
+
+/// Ids both judge passes flagged.
+fn agreed<'a>(first: &'a [String], second: &[String]) -> BTreeSet<&'a str> {
+    first.iter().filter(|id| second.contains(id)).map(String::as_str).collect()
 }
 
 /// Entity id without a spill suffix (`w_app_2` -> `w_app`).
@@ -203,7 +223,8 @@ fn forget_all(
                 touched = true;
             }
         }
-        if touched {
+        // Also prunes facts forgotten by an earlier tidy or `change forget`.
+        if entity.prune_forgotten(&controls) || touched {
             entity.refresh_body();
             index_updates.insert(path.clone(), Some(entity.clone()));
             changes.push((path.clone(), Change::Write { content: entity.render() }));
@@ -223,6 +244,14 @@ fn forget_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_facts_both_passes_flag_are_session_only() {
+        let a = vec!["fact_1".to_string(), "fact_2".to_string()];
+        let b = vec!["fact_2".to_string(), "fact_3".to_string()];
+        assert_eq!(agreed(&a, &b).into_iter().collect::<Vec<_>>(), ["fact_2"]);
+        assert!(agreed(&a, &[]).is_empty());
+    }
     use crate::change::{apply, ChangeKind, ChangeRequest};
     use crate::fact::{Fact, FactKind, Visibility};
 
@@ -295,5 +324,39 @@ mod tests {
         assert!(controls.is_suppressed("fact_short"));
         assert!(!controls.is_suppressed("fact_full"));
         assert!(!controls.is_suppressed("fact_other"));
+    }
+
+    #[test]
+    fn apply_removes_facts_forgotten_by_an_older_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = GitRepo::create(tmp.path()).unwrap();
+        remember(&repo, "r1", "p_sam", "fact_keep", "Sam likes tea.");
+        remember(&repo, "r2", "p_sam", "fact_old", "Sam was debugging the login page today.");
+        // An older mem forgot a fact by marking it, leaving its text in the file.
+        let head = repo.head().unwrap();
+        let path = "memory/people/sam.md";
+        let mut entity = EntityFile::parse(&repo.read_snapshot(&head, path).unwrap().unwrap().content).unwrap();
+        entity.retract("fact_old").unwrap();
+        let mut controls = Controls::default();
+        controls.add_suppression(Suppression {
+            target: "fact_old".into(),
+            kind: SuppressionKind::SoftForget,
+            suppressed_at: Utc::now(),
+            reason: None,
+        });
+        controls.add_retraction("fact_old");
+        let changes = ChangeSet::new(vec![
+            (path.to_string(), Change::Write { content: entity.render() }),
+            ("state/controls.json".to_string(), Change::Write { content: controls.render().unwrap() }),
+        ])
+        .unwrap();
+        repo.publish(&head, "old_forget", &changes, &crate::validate::DomainValidator).unwrap();
+
+        let report = tidy(&repo, true, &[]).unwrap();
+        assert_eq!(report.compacted, 1);
+        assert!(report.applied_at.is_some());
+        let head = repo.head().unwrap();
+        let after = EntityFile::parse(&repo.read_snapshot(&head, path).unwrap().unwrap().content).unwrap();
+        assert_eq!(after.facts.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["fact_keep"]);
     }
 }
