@@ -46,7 +46,7 @@ pub use controls::Controls;
 pub use checkpoint::Checkpoint;
 pub use change::{ChangeKind, ChangeRequest, ChangeOutcome, apply as apply_change, apply_against_base, recover_in_dir};
 pub use consolidate::{Consolidator, ConsolidateOptions, ExtractorKind};
-pub use ingest::{Adapter, ChatExportAdapter, ClaudeAdapter, CodexAdapter, CalendarAdapter, VoiceAdapter, IdeHistoryAdapter, IngestReport, adapter_for};
+pub use ingest::{Adapter, ChatExportAdapter, ClaudeAdapter, CodexAdapter, PiAdapter, CalendarAdapter, VoiceAdapter, IdeHistoryAdapter, IngestReport, adapter_for};
 pub use index::{render_index_md, INDEX_MD};
 pub use search::{Search, SearchHit, LexicalSearch, SearchQuery, eligible_facts};
 pub use jev::{JevReranker, JevDecision};

@@ -499,6 +499,145 @@ pub(crate) fn is_codex_subagent(meta: &serde_json::Value) -> bool {
     payload["thread_source"].as_str() == Some("subagent") || payload["source"].get("subagent").is_some()
 }
 
+/// pi / omp session adapter. `omp` is a pi fork and both write the same
+/// JSONL: an optional `title` line, then a `session` header carrying
+/// `version` and the session's `cwd`, then a tree of entries where a
+/// `message` entry holds an `AgentMessage`. Only the user's and the
+/// assistant's text is ingested: thinking, tool calls, tool results,
+/// extension-injected `custom` messages, and compaction or branch
+/// summaries are skipped, like the other transcript adapters.
+pub struct PiAdapter;
+
+impl Adapter for PiAdapter {
+    fn name(&self) -> &'static str {
+        "pi"
+    }
+
+    fn read(&self, path: &Path, scope_id: &str, session_id: &str) -> Result<Vec<JournalEvent>> {
+        // The source prefix keeps pi and omp events (and the two harnesses)
+        // apart even when a session is cloned between them.
+        let harness = pi_harness(path);
+        let reader = buffered_lines(path)?;
+        let mut events = Vec::new();
+        let mut session_uuid: Option<String> = None;
+        let mut cwd: Option<String> = None;
+        for (line_no, line) in reader.lines().enumerate() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let value: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            match value.get("type").and_then(|v| v.as_str()) {
+                Some("session") => {
+                    session_uuid = value.get("id").and_then(|v| v.as_str()).map(str::to_string);
+                    cwd = value.get("cwd").and_then(|v| v.as_str()).map(str::to_string);
+                }
+                Some("message") => {
+                    let Some(message) = value.get("message") else { continue };
+                    let role = match message.get("role").and_then(|v| v.as_str()) {
+                        Some("user") => Role::User,
+                        Some("assistant") => Role::Assistant,
+                        // toolResult / custom / bashExecution / summaries:
+                        // not the user's or the assistant's own words.
+                        _ => continue,
+                    };
+                    let text = extract_pi_text(message.get("content"));
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    let occurred_at = value
+                        .get("timestamp")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                        .map(|d| d.with_timezone(&Utc))
+                        .or_else(|| {
+                            message
+                                .get("timestamp")
+                                .and_then(|v| v.as_i64())
+                                .and_then(DateTime::from_timestamp_millis)
+                        });
+                    let uuid = session_uuid.clone().unwrap_or_else(|| session_id.to_string());
+                    // Every entry has its own 8-char id; the line number is
+                    // the fallback for records written without one.
+                    let entry_key = value
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("line{line_no}"));
+                    let mut event = JournalEvent::new(
+                        scope_id.to_string(),
+                        session_id.to_string(),
+                        role,
+                        Source::Chat {
+                            source_id: format!("{harness}:{uuid}:{entry_key}"),
+                            occurred_at,
+                        },
+                        text,
+                        Redaction::None,
+                    );
+                    if let Some(cwd) = &cwd {
+                        event.set_project_from(cwd);
+                    }
+                    events.push(event);
+                }
+                _ => {}
+            }
+        }
+        Ok(events)
+    }
+}
+
+/// Which harness wrote a pi-format session: `omp` for `~/.omp/...`, else `pi`.
+fn pi_harness(path: &Path) -> &'static str {
+    if path.components().any(|c| c.as_os_str() == ".omp") {
+        "omp"
+    } else {
+        "pi"
+    }
+}
+
+/// The working directory a pi/omp session ran in, read from its `session`
+/// header without parsing the messages. `None` when the file is not a pi
+/// session or the header has no `cwd`.
+pub(crate) fn pi_session_cwd(path: &Path) -> Option<String> {
+    let reader = buffered_lines(path).ok()?;
+    for line in reader.lines().map_while(|l| l.ok()) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(|v| v.as_str()) == Some("session") {
+            return value.get("cwd").and_then(|v| v.as_str()).map(str::to_string);
+        }
+    }
+    None
+}
+
+/// Text of a pi/omp message: a plain string, or the `text` blocks of a
+/// content array (thinking and tool-call blocks are dropped).
+fn extract_pi_text(value: Option<&serde_json::Value>) -> String {
+    match value {
+        Some(serde_json::Value::String(s)) => s.replace('\u{0}', ""),
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .filter(|p| p.get("type").and_then(|v| v.as_str()) == Some("text"))
+            .filter_map(|p| p.get("text").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
 pub(crate) fn extract_text_parts(value: Option<&serde_json::Value>) -> String {
     let Some(v) = value else {
         return String::new();
@@ -844,6 +983,7 @@ pub fn adapter_for(path: &Path) -> Result<Box<dyn Adapter>> {
         "jsonl" | "json" => Ok(match sniff_jsonl(path) {
             JsonlKind::Claude => Box::new(ClaudeAdapter),
             JsonlKind::Codex => Box::new(CodexAdapter),
+            JsonlKind::Pi => Box::new(PiAdapter),
             JsonlKind::ChatExport => Box::new(ChatExportAdapter),
         }),
         "ics" => Ok(Box::new(CalendarAdapter)),
@@ -858,6 +998,7 @@ pub fn adapter_for(path: &Path) -> Result<Box<dyn Adapter>> {
 enum JsonlKind {
     Claude,
     Codex,
+    Pi,
     ChatExport,
 }
 
@@ -880,6 +1021,13 @@ fn sniff_jsonl(path: &Path) -> JsonlKind {
         {
             return JsonlKind::Codex;
         }
+        // pi / omp: a `session` header, or a tree entry carrying a message.
+        if kind == "session" && value.get("version").is_some() && value.get("cwd").is_some() {
+            return JsonlKind::Pi;
+        }
+        if kind == "message" && value.get("parentId").is_some() && value.get("message").is_some() {
+            return JsonlKind::Pi;
+        }
         if value.get("role").is_some() || value.get("text").is_some() {
             return JsonlKind::ChatExport;
         }
@@ -898,14 +1046,78 @@ mod tests {
         std::fs::write(&claude, r#"{"type":"user","sessionId":"S","message":{"content":"hi"}}"#).unwrap();
         let codex = dir.path().join("b.jsonl");
         std::fs::write(&codex, r#"{"type":"session_meta","payload":{"id":"C"}}"#).unwrap();
-        let chat = dir.path().join("c.jsonl");
+        let pi = dir.path().join("c.jsonl");
+        std::fs::write(&pi, r#"{"type":"session","version":3,"id":"P","cwd":"/tmp/p"}"#).unwrap();
+        let pi_msg = dir.path().join("c-msg.jsonl");
+        std::fs::write(&pi_msg, r#"{"type":"message","id":"e1","parentId":null,"message":{"role":"user","content":"hi"}}"#).unwrap();
+        let chat = dir.path().join("d.jsonl");
         std::fs::write(&chat, r#"{"id":"m1","role":"user","text":"hi"}"#).unwrap();
         let ide = dir.path().join("x.ide.json");
         std::fs::write(&ide, r#"{"events":[]}"#).unwrap();
         assert_eq!(adapter_for(&claude).unwrap().name(), "claude_code");
         assert_eq!(adapter_for(&codex).unwrap().name(), "codex");
+        assert_eq!(adapter_for(&pi).unwrap().name(), "pi");
+        assert_eq!(adapter_for(&pi_msg).unwrap().name(), "pi");
         assert_eq!(adapter_for(&chat).unwrap().name(), "chat_export");
         assert_eq!(adapter_for(&ide).unwrap().name(), "ide_history");
+    }
+
+    #[test]
+    fn pi_adapter_reads_text_only_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pi.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"title","v":1,"title":"Work"}"#, "\n",
+                r#"{"type":"session","version":3,"id":"S","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/proj"}"#, "\n",
+                r#"{"type":"model_change","id":"m","parentId":null}"#, "\n",
+                r#"{"type":"message","id":"u1","parentId":"m","timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":[{"type":"text","text":"we deploy with fly"}]}}"#, "\n",
+                r#"{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-01-01T00:00:02Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"secret"},{"type":"text","text":"Noted."},{"type":"toolCall","name":"bash","arguments":{"command":"ls"}}],"timestamp":1785019122997}}"#, "\n",
+                r#"{"type":"message","id":"t1","parentId":"a1","message":{"role":"toolResult","content":[{"type":"text","text":"tool output"}]}}"#, "\n",
+                r#"{"type":"message","id":"c1","parentId":"a1","message":{"role":"custom","customType":"x","content":"injected"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let events = PiAdapter.read(&path, "p", "s").unwrap();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].role, Role::User);
+        assert_eq!(events[0].content, "we deploy with fly");
+        assert_eq!(events[0].project(), Some("/tmp/proj"));
+        assert_eq!(events[1].role, Role::Assistant);
+        assert_eq!(events[1].content, "Noted.");
+        assert!(events[0].source.event_id().contains("pi:S:u1"));
+
+        // The same file read twice yields the same stable ids, so the
+        // journal skips the second write.
+        let again = PiAdapter.read(&path, "p", "s").unwrap();
+        assert_eq!(events[0].event_id, again[0].event_id);
+        let journal_dir = dir.path().join("journal");
+        let writer = crate::journal::BulkWriter::open(&journal_dir).unwrap();
+        assert_eq!(writer.append_many(events).unwrap(), 2);
+        drop(writer);
+        let writer = crate::journal::BulkWriter::open(&journal_dir).unwrap();
+        assert_eq!(writer.append_many(again).unwrap(), 0);
+    }
+
+    #[test]
+    fn pi_and_omp_sessions_do_not_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = concat!(
+            r#"{"type":"session","version":3,"id":"S","cwd":"/tmp/p"}"#, "\n",
+            r#"{"type":"message","id":"u1","parentId":null,"message":{"role":"user","content":"hi"}}"#, "\n",
+        );
+        let pi = dir.path().join("pi.jsonl");
+        std::fs::write(&pi, body).unwrap();
+        let omp_dir = dir.path().join(".omp").join("agent").join("sessions");
+        std::fs::create_dir_all(&omp_dir).unwrap();
+        let omp = omp_dir.join("omp.jsonl");
+        std::fs::write(&omp, body).unwrap();
+        let a = PiAdapter.read(&pi, "p", "s").unwrap();
+        let b = PiAdapter.read(&omp, "p", "s").unwrap();
+        assert!(a[0].source.event_id().contains("pi:S:u1"));
+        assert!(b[0].source.event_id().contains("omp:S:u1"));
+        assert_ne!(a[0].event_id, b[0].event_id);
     }
 
     #[test]
